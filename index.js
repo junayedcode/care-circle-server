@@ -51,10 +51,10 @@ app.post("/events", async (req, res) => {
   }
 });
 
-// 3. Route to Fetch All Events
+// 3. Route to Fetch All Events (sorted by event date)
 app.get('/events', async (req, res) => {
   try {
-    const result = await eventCollection.find().toArray();
+    const result = await eventCollection.find().sort({ date: 1 }).toArray();
     res.send(result);
   } catch (error) {
     res.status(500).send({ error: "Failed to fetch events" });
@@ -89,7 +89,13 @@ app.get("/events/joined", async (req, res) => {
 app.get('/event/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).send({ error: "Event not found" });
+    }
     const result = await eventCollection.findOne({ _id: new ObjectId(id) });
+    if (!result) {
+      return res.status(404).send({ error: "Event not found" });
+    }
     res.send(result);
   } catch (error) {
     res.status(500).send({ error: "Failed to fetch event details" });
@@ -101,6 +107,9 @@ app.post("/event/:id/join", async (req, res) => {
   try {
     const eventId = req.params.id;
     const { email, name, image } = req.body;
+    if (!ObjectId.isValid(eventId)) {
+      return res.status(404).send({ message: "Event not found" });
+    }
 
     const event = await eventCollection.findOne({ _id: new ObjectId(eventId) });
     if (!event) {
@@ -132,6 +141,9 @@ app.post("/event/:id/leave", async (req, res) => {
   try {
     const eventId = req.params.id;
     const { email } = req.body;
+    if (!ObjectId.isValid(eventId)) {
+      return res.status(404).send({ message: "Event not found" });
+    }
 
     const result = await eventCollection.updateOne(
       { _id: new ObjectId(eventId) },
@@ -156,6 +168,9 @@ app.post("/event/:id/leave", async (req, res) => {
 app.put("/event/:id", async (req, res) => {
   try {
     const id = req.params.id;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).send({ error: "Event not found" });
+    }
     const updatedEvent = req.body;
     const filter = { _id: new ObjectId(id) };
     const updateDoc = {
@@ -179,6 +194,9 @@ app.put("/event/:id", async (req, res) => {
 app.delete("/event/:id", async (req, res) => {
   try {
     const id = req.params.id;
+    if (!ObjectId.isValid(id)) {
+      return res.status(404).send({ error: "Event not found" });
+    }
     const query = { _id: new ObjectId(id) };
     const result = await eventCollection.deleteOne(query);
     res.send({ success: true, result });

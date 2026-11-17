@@ -1,16 +1,14 @@
+
 {
   "name": "care-circle-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "CareCircle Backend API",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon index"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",

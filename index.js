@@ -20,7 +20,7 @@ app.use(
 
 app.use(express.json());
 
-// MongoDB Connection (UNCHANGED)
+// MongoDB Connection
 const client = new MongoClient(process.env.MONGODB_URL);
 
 export async function connectToMongoDB() {
@@ -29,7 +29,7 @@ export async function connectToMongoDB() {
     console.log("You successfully connected to MongoDB!");
     return client;
   } catch (err) {
-    console.dir(err);
+    console.error("MongoDB connection error:", err);
     return null;
   }
 }
@@ -59,6 +59,7 @@ const SESSION_COOKIE_NAMES = [
   "__Secure-better-auth.session_token",
 ];
 
+// Parse Cookies
 function parseCookies(req) {
   const header = req.headers.cookie || "";
   const cookies = {};
@@ -82,18 +83,48 @@ function parseCookies(req) {
   return cookies;
 }
 
+// Verify Better Auth Session
 async function verifySession(req) {
+  console.log("========== AUTH DEBUG ==========");
+
+  console.log(
+    "Cookie received:",
+    req.headers.cookie ? "YES" : "NO"
+  );
+
+  console.log(
+    "Cookie names:",
+    req.headers.cookie
+      ? req.headers.cookie
+          .split(";")
+          .map((c) => c.split("=")[0].trim())
+      : "No cookies found"
+  );
+
   const cookies = parseCookies(req);
 
   const raw = SESSION_COOKIE_NAMES
     .map((name) => cookies[name])
     .find(Boolean);
 
-  if (!raw) return null;
+  console.log(
+    "Session cookie found:",
+    raw ? "YES" : "NO"
+  );
+
+  if (!raw) {
+    console.log("AUTH RESULT: No session cookie");
+    console.log("================================");
+    return null;
+  }
 
   const dotIndex = raw.lastIndexOf(".");
 
-  if (dotIndex === -1) return null;
+  if (dotIndex === -1) {
+    console.log("AUTH RESULT: Invalid cookie format");
+    console.log("================================");
+    return null;
+  }
 
   const token = raw.slice(0, dotIndex);
   const signature = raw.slice(dotIndex + 1);
@@ -111,13 +142,21 @@ async function verifySession(req) {
       given.length !== wanted.length ||
       !crypto.timingSafeEqual(given, wanted)
     ) {
+      console.log("AUTH RESULT: Invalid signature");
+      console.log("================================");
       return null;
     }
   }
 
-  const session = await authSessionCollection.findOne({ token });
+  const session = await authSessionCollection.findOne({
+    token,
+  });
 
-  if (!session) return null;
+  if (!session) {
+    console.log("AUTH RESULT: Session not found in MongoDB");
+    console.log("================================");
+    return null;
+  }
 
   const expiresAt = new Date(session.expiresAt);
 
@@ -125,6 +164,8 @@ async function verifySession(req) {
     Number.isNaN(expiresAt.getTime()) ||
     expiresAt <= new Date()
   ) {
+    console.log("AUTH RESULT: Session expired");
+    console.log("================================");
     return null;
   }
 
@@ -136,8 +177,16 @@ async function verifySession(req) {
       _id: session.userId,
     }));
 
-  if (!user) return null;
-console.log("Cookie received:", req.headers.cookie ? "YES" : "NO");
+  if (!user) {
+    console.log("AUTH RESULT: User not found");
+    console.log("================================");
+    return null;
+  }
+
+  console.log("AUTH RESULT: SUCCESS");
+  console.log("User authenticated:", user.email);
+  console.log("================================");
+
   return { session, user };
 }
 
@@ -147,11 +196,9 @@ async function requireAuth(req, res, next) {
     const auth = await verifySession(req);
 
     if (!auth) {
-      return res
-        .status(401)
-        .send({
-          message: "You must be logged in to perform this action.",
-        });
+      return res.status(401).send({
+        message: "You must be logged in to perform this action.",
+      });
     }
 
     req.authUser = auth.user;
@@ -167,7 +214,9 @@ async function requireAuth(req, res, next) {
 
 // 1. Root Route
 app.get("/", (req, res) => {
-  res.send({ message: "Hello World!" });
+  res.send({
+    message: "Hello World!",
+  });
 });
 
 // 2. Create Event
@@ -208,7 +257,10 @@ async function createEventHandler(req, res) {
       createdAt: new Date(),
     });
 
-    res.send({ success: true, result });
+    res.send({
+      success: true,
+      result,
+    });
   } catch (error) {
     console.error("Failed to create event:", error);
 
@@ -377,6 +429,8 @@ app.post("/event/:id/join", requireAuth, async (req, res) => {
       message: "Successfully joined the event!",
     });
   } catch (error) {
+    console.error("Join event error:", error);
+
     res.status(500).send({
       error: "Failed to join event",
     });
@@ -418,6 +472,8 @@ app.post("/event/:id/leave", requireAuth, async (req, res) => {
       message: "Successfully left the event!",
     });
   } catch (error) {
+    console.error("Leave event error:", error);
+
     res.status(500).send({
       error: "Failed to leave event",
     });
@@ -483,8 +539,13 @@ app.put("/event/:id", requireAuth, async (req, res) => {
       }
     );
 
-    res.send({ success: true, result });
+    res.send({
+      success: true,
+      result,
+    });
   } catch (error) {
+    console.error("Update event error:", error);
+
     res.status(500).send({
       error: "Failed to update event",
     });
@@ -522,18 +583,20 @@ app.delete("/event/:id", requireAuth, async (req, res) => {
       _id: new ObjectId(id),
     });
 
-    res.send({ success: true, result });
+    res.send({
+      success: true,
+      result,
+    });
   } catch (error) {
+    console.error("Delete event error:", error);
+
     res.status(500).send({
       error: "Failed to delete event",
     });
   }
 });
 
-// ==========================================
-// LOCALHOST + VERCEL
-// ==========================================
-
+// Localhost + Vercel
 if (!process.env.VERCEL) {
   app.listen(port, () => {
     console.log(`CareCircle API listening on port ${port}`);
@@ -542,7 +605,7 @@ if (!process.env.VERCEL) {
       `Session HMAC verification: ${
         process.env.BETTER_AUTH_SECRET
           ? "ENABLED"
-          : "DISABLED (set BETTER_AUTH_SECRET)"
+          : "DISABLED"
       }`
     );
   });

@@ -1,12 +1,24 @@
-import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
-import cors from 'cors';
+import { MongoClient, ObjectId } from "mongodb";
+import crypto from "node:crypto";
+import cors from "cors";
 import express from "express";
-import 'dotenv/config';
+import "dotenv/config";
 
 const app = express();
-const port = 8000;
+const port = process.env.PORT || 8000;
 
-app.use(cors());
+// CORS: reflect the request origin and allow credentials so the browser sends
+// the Better Auth session cookie with cross-origin API calls.
+// Set CORS_ORIGIN (comma-separated list) in production to restrict access,
+// e.g. CORS_ORIGIN=https://care-circle-navy-one.vercel.app
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN
+      ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim())
+      : true,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URL);
@@ -18,41 +30,160 @@ export async function connectToMongoDB() {
     return client;
   } catch (err) {
     console.dir(err);
+    return null;
   }
 }
 
 const mongoclient = await connectToMongoDB();
+if (!mongoclient) {
+  console.error("MongoDB connection failed — server cannot start.");
+  process.exit(1);
+}
+
+// Events live in the "create-event" database (existing data is untouched).
 const db = mongoclient.db("create-event");
 const eventCollection = db.collection("Events");
 
+// Better Auth stores its sessions in the "care-circle" database
+// (same cluster, configured in src/lib/auth.js). Reading them here lets the
+// API verify real server-side sessions instead of trusting client-sent emails.
+const authSessionCollection = mongoclient.db("care-circle").collection("session");
+const authUserCollection = mongoclient.db("care-circle").collection("user");
+
+// ---------------------------------------------------------------------------
+// Better Auth session verification
+// ---------------------------------------------------------------------------
+// The session cookie value is "<rawToken>.<base64 HMAC-SHA256 signature>"
+// (verified against better-auth's cookie signing code). The raw token is
+// stored as-is in the session document's `token` field.
+const SESSION_COOKIE_NAMES = [
+  "better-auth.session_token",
+  "__Secure-better-auth.session_token",
+];
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const cookies = {};
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const name = part.slice(0, idx).trim();
+    try {
+      cookies[name] = decodeURIComponent(part.slice(idx + 1).trim());
+    } catch {
+      cookies[name] = part.slice(idx + 1).trim();
+    }
+  }
+  return cookies;
+}
+
+async function verifySession(req) {
+  const cookies = parseCookies(req);
+  const raw = SESSION_COOKIE_NAMES.map((name) => cookies[name]).find(Boolean);
+  if (!raw) return null;
+
+  const dotIndex = raw.lastIndexOf(".");
+  if (dotIndex === -1) return null;
+  const token = raw.slice(0, dotIndex);
+  const signature = raw.slice(dotIndex + 1);
+
+  // Verify the HMAC signature when BETTER_AUTH_SECRET is available
+  // (constant-time comparison, mirrors better-auth's HMAC-SHA256/base64).
+  if (process.env.BETTER_AUTH_SECRET) {
+    const expected = crypto
+      .createHmac("sha256", process.env.BETTER_AUTH_SECRET)
+      .update(token)
+      .digest("base64");
+    const given = Buffer.from(signature);
+    const wanted = Buffer.from(expected);
+    if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
+      return null;
+    }
+  }
+
+  const session = await authSessionCollection.findOne({ token });
+  if (!session) return null;
+
+  const expiresAt = new Date(session.expiresAt);
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+    return null;
+  }
+
+  // The mongo adapter exposes the Better Auth user id as `id`.
+  const user =
+    (await authUserCollection.findOne({ id: session.userId })) ||
+    (await authUserCollection.findOne({ _id: session.userId }));
+  if (!user) return null;
+
+  return { session, user };
+}
+
+// Middleware: reject requests without a valid Better Auth session.
+async function requireAuth(req, res, next) {
+  try {
+    const auth = await verifySession(req);
+    if (!auth) {
+      return res
+        .status(401)
+        .send({ message: "You must be logged in to perform this action." });
+    }
+    req.authUser = auth.user;
+    next();
+  } catch (error) {
+    console.error("Session verification failed:", error);
+    res.status(500).send({ message: "Failed to verify session" });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 // 1. Root Route Check
-app.get('/', (req, res) => {
-  res.send({ message: 'Hello World!' });
+app.get("/", (req, res) => {
+  res.send({ message: "Hello World!" });
 });
 
-// 2. Route to Create a New Event
-app.post('/create-event', async (req, res) => {
+// 2. Route to Create a New Event (session required; organizer fields are
+//    taken from the verified session — client-sent organizer* is ignored)
+async function createEventHandler(req, res) {
   try {
-    const data = req.body;
-    const result = await eventCollection.insertOne(data);
-    res.send({ success: true, result });
-  } catch (error) {
-    res.status(500).send({ error: "Failed to create event" });
-  }
-});
+    const { title, type, date, location, thumbnail, description } = req.body;
 
-app.post("/events", async (req, res) => {
-  try {
-    const newEvent = req.body;
-    const result = await eventCollection.insertOne(newEvent);
+    // Basic request validation
+    if (!title?.trim() || !date?.trim() || !location?.trim() || !description?.trim()) {
+      return res.status(400).send({
+        message: "Title, date, location and description are required.",
+      });
+    }
+
+    const result = await eventCollection.insertOne({
+      title: title.trim(),
+      type: type || "Donation",
+      date,
+      location: location.trim(),
+      thumbnail: thumbnail || "",
+      description,
+      organizerEmail: req.authUser.email,
+      organizerName: req.authUser.name || "Organizer",
+      organizerImage: req.authUser.image || "",
+      volunteers: [],
+      createdAt: new Date(),
+    });
+
     res.send({ success: true, result });
   } catch (error) {
+    console.error("Failed to create event:", error);
     res.status(500).send({ error: "Failed to create event" });
   }
-});
+}
+
+app.post("/events", requireAuth, createEventHandler);
+// Legacy alias kept for backward compatibility with older clients.
+app.post("/create-event", requireAuth, createEventHandler);
 
 // 3. Route to Fetch All Events (sorted by event date)
-app.get('/events', async (req, res) => {
+app.get("/events", async (req, res) => {
   try {
     const result = await eventCollection.find().sort({ date: 1 }).toArray();
     res.send(result);
@@ -86,7 +217,7 @@ app.get("/events/joined", async (req, res) => {
 });
 
 // 6. Route to Fetch Single Event Details by ID
-app.get('/event/:id', async (req, res) => {
+app.get("/event/:id", async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -102,33 +233,50 @@ app.get('/event/:id', async (req, res) => {
   }
 });
 
-// 7. Route to Join an Event
-app.post("/event/:id/join", async (req, res) => {
+// 7. Route to Join an Event (session required; the joining user is always
+//    taken from the verified session, never from the request body)
+app.post("/event/:id/join", requireAuth, async (req, res) => {
   try {
     const eventId = req.params.id;
-    const { email, name, image } = req.body;
     if (!ObjectId.isValid(eventId)) {
       return res.status(404).send({ message: "Event not found" });
     }
 
+    const user = req.authUser;
     const event = await eventCollection.findOne({ _id: new ObjectId(eventId) });
     if (!event) {
       return res.status(404).send({ message: "Event not found" });
     }
 
-    const alreadyJoined = event.volunteers?.some((vol) => vol.email === email);
-    if (alreadyJoined) {
-      return res.status(400).send({ message: "You have already joined this event!" });
+    // Capacity check — only enforced when a capacity is configured on the event.
+    const capacity = Number(event.capacity ?? event.maxVolunteers);
+    const currentCount = event.volunteers?.length || 0;
+    if (Number.isFinite(capacity) && capacity > 0 && currentCount >= capacity) {
+      return res.status(409).send({ message: "This event is already full." });
     }
 
-    await eventCollection.updateOne(
-      { _id: new ObjectId(eventId) },
+    // Atomic guard: the update only succeeds if the user has NOT joined yet
+    // (prevents duplicate joins even under concurrent requests).
+    const result = await eventCollection.updateOne(
+      {
+        _id: new ObjectId(eventId),
+        "volunteers.email": { $ne: user.email },
+      },
       {
         $push: {
-          volunteers: { email, name, image, joinedAt: new Date() },
+          volunteers: {
+            email: user.email,
+            name: user.name || "Volunteer",
+            image: user.image || "",
+            joinedAt: new Date(),
+          },
         },
       }
     );
+
+    if (result.modifiedCount === 0) {
+      return res.status(400).send({ message: "You have already joined this event!" });
+    }
 
     res.send({ success: true, message: "Successfully joined the event!" });
   } catch (error) {
@@ -136,11 +284,10 @@ app.post("/event/:id/join", async (req, res) => {
   }
 });
 
-// 8. Route to Leave an Event
-app.post("/event/:id/leave", async (req, res) => {
+// 8. Route to Leave an Event (session required; email comes from the session)
+app.post("/event/:id/leave", requireAuth, async (req, res) => {
   try {
     const eventId = req.params.id;
-    const { email } = req.body;
     if (!ObjectId.isValid(eventId)) {
       return res.status(404).send({ message: "Event not found" });
     }
@@ -149,7 +296,7 @@ app.post("/event/:id/leave", async (req, res) => {
       { _id: new ObjectId(eventId) },
       {
         $pull: {
-          volunteers: { email: email },
+          volunteers: { email: req.authUser.email },
         },
       }
     );
@@ -164,41 +311,71 @@ app.post("/event/:id/leave", async (req, res) => {
   }
 });
 
-// 9. Route to Update/Edit an Event
-app.put("/event/:id", async (req, res) => {
+// 9. Route to Update/Edit an Event (session required + ownership verified)
+app.put("/event/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
       return res.status(404).send({ error: "Event not found" });
     }
-    const updatedEvent = req.body;
-    const filter = { _id: new ObjectId(id) };
-    const updateDoc = {
-      $set: {
-        title: updatedEvent.title,
-        type: updatedEvent.type,
-        date: updatedEvent.date,
-        location: updatedEvent.location,
-        thumbnail: updatedEvent.thumbnail,
-        description: updatedEvent.description,
-      },
-    };
-    const result = await eventCollection.updateOne(filter, updateDoc);
+
+    const event = await eventCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) {
+      return res.status(404).send({ error: "Event not found" });
+    }
+
+    // Authorization: only the organizer may edit their own event.
+    if (event.organizerEmail !== req.authUser.email) {
+      return res
+        .status(403)
+        .send({ message: "You are not allowed to edit this event." });
+    }
+
+    // Only update the fields that were actually provided (whitelisted),
+    // so missing fields can never wipe existing data.
+    const editableFields = ["title", "type", "date", "location", "thumbnail", "description"];
+    const updateDoc = {};
+    for (const field of editableFields) {
+      if (req.body[field] !== undefined) {
+        updateDoc[field] = req.body[field];
+      }
+    }
+
+    if (Object.keys(updateDoc).length === 0) {
+      return res.status(400).send({ message: "No valid fields to update." });
+    }
+
+    const result = await eventCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateDoc }
+    );
     res.send({ success: true, result });
   } catch (error) {
     res.status(500).send({ error: "Failed to update event" });
   }
 });
 
-// 10. Route to Delete an Event
-app.delete("/event/:id", async (req, res) => {
+// 10. Route to Delete an Event (session required + ownership verified)
+app.delete("/event/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
       return res.status(404).send({ error: "Event not found" });
     }
-    const query = { _id: new ObjectId(id) };
-    const result = await eventCollection.deleteOne(query);
+
+    const event = await eventCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) {
+      return res.status(404).send({ error: "Event not found" });
+    }
+
+    // Authorization: only the organizer may delete their own event.
+    if (event.organizerEmail !== req.authUser.email) {
+      return res
+        .status(403)
+        .send({ message: "You are not allowed to delete this event." });
+    }
+
+    const result = await eventCollection.deleteOne({ _id: new ObjectId(id) });
     res.send({ success: true, result });
   } catch (error) {
     res.status(500).send({ error: "Failed to delete event" });
@@ -206,5 +383,9 @@ app.delete("/event/:id", async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
+  console.log(`CareCircle API listening on port ${port}`);
+  // Log whether server-side session verification is active (never log the secret itself).
+  console.log(
+    `Session HMAC verification: ${process.env.BETTER_AUTH_SECRET ? "ENABLED" : "DISABLED (set BETTER_AUTH_SECRET)"}`
+  );
 });

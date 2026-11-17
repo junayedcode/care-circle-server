@@ -1,225 +1,227 @@
 
-import { MongoClient, ObjectId } from "mongodb";
-import crypto from "node:crypto";
-import cors from "cors";
 import express from "express";
+import cors from "cors";
 import "dotenv/config";
+import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 8000;
 
-// CORS
+// ==========================================
+// AUTH CONFIGURATION
+// ==========================================
+
+// Better Auth runs on the FRONTEND (Next.js).
+// Local: http://localhost:3000
+// Production: https://care-circle-navy-one.vercel.app
+
+const AUTH_BASE_URL = (
+  process.env.AUTH_BASE_URL || process.env.BETTER_AUTH_URL
+)?.trim().replace(/\/+$/, "");
+
+if (!AUTH_BASE_URL) {
+  throw new Error("AUTH_BASE_URL is missing in .env");
+}
+
+let JWKS_URL;
+
+try {
+  JWKS_URL = new URL("/api/auth/jwks", AUTH_BASE_URL);
+} catch {
+  throw new Error(
+    "Invalid AUTH_BASE_URL. Check your backend .env file."
+  );
+}
+
+console.log("Auth Base URL:", AUTH_BASE_URL);
+console.log("JWKS URL:", JWKS_URL.toString());
+
+const JWKS = createRemoteJWKSet(JWKS_URL);
+
+// ==========================================
+// CORS CONFIGURATION
+// ==========================================
+
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((origin) =>
+      origin.trim().replace(/\/+$/, "")
+    )
+  : ["http://localhost:3000"];
+
+if (!allowedOrigins.includes(AUTH_BASE_URL)) {
+  allowedOrigins.push(AUTH_BASE_URL);
+}
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim())
-      : true,
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log("CORS blocked origin:", origin);
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
 
 app.use(express.json());
 
-// MongoDB Connection
-const client = new MongoClient(process.env.MONGODB_URL);
+// ==========================================
+// MONGODB CONNECTION
+// ==========================================
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
-    return null;
-  }
+const mongoUrl = process.env.MONGODB_URL;
+
+if (!mongoUrl) {
+  throw new Error("MONGODB_URL is missing");
 }
 
-const mongoclient = await connectToMongoDB();
+const client = new MongoClient(mongoUrl);
 
-if (!mongoclient) {
-  console.error("MongoDB connection failed — server cannot start.");
-  process.exit(1);
-}
+await client.connect();
 
-// Database
-const db = mongoclient.db("create-event");
+console.log("MongoDB connected successfully");
+
+const db = client.db("create-event");
 const eventCollection = db.collection("Events");
 
-const authSessionCollection = mongoclient
-  .db("care-circle")
-  .collection("session");
-
-const authUserCollection = mongoclient
+const authUserCollection = client
   .db("care-circle")
   .collection("user");
 
-// Better Auth Session Verification
-const SESSION_COOKIE_NAMES = [
-  "better-auth.session_token",
-  "__Secure-better-auth.session_token",
-];
+// ==========================================
+// FIND AUTH USER
+// ==========================================
 
-// Parse Cookies
-function parseCookies(req) {
-  const header = req.headers.cookie || "";
-  const cookies = {};
+async function findAuthUser(userId) {
+  const conditions = [
+    { id: userId },
+    { _id: userId },
+  ];
 
-  for (const part of header.split(";")) {
-    const idx = part.indexOf("=");
-
-    if (idx === -1) continue;
-
-    const name = part.slice(0, idx).trim();
-
-    try {
-      cookies[name] = decodeURIComponent(
-        part.slice(idx + 1).trim()
-      );
-    } catch {
-      cookies[name] = part.slice(idx + 1).trim();
-    }
+  if (ObjectId.isValid(userId)) {
+    conditions.push({
+      _id: new ObjectId(userId),
+    });
   }
 
-  return cookies;
+  return authUserCollection.findOne({
+    $or: conditions,
+  });
 }
 
-// Verify Better Auth Session
+// ==========================================
+// JWT AUTHENTICATION
+// ==========================================
+
 async function verifySession(req) {
-  console.log("========== AUTH DEBUG ==========");
+  const authHeader = req.headers.authorization;
 
-  console.log(
-    "Cookie received:",
-    req.headers.cookie ? "YES" : "NO"
-  );
-
-  console.log(
-    "Cookie names:",
-    req.headers.cookie
-      ? req.headers.cookie
-          .split(";")
-          .map((c) => c.split("=")[0].trim())
-      : "No cookies found"
-  );
-
-  const cookies = parseCookies(req);
-
-  const raw = SESSION_COOKIE_NAMES
-    .map((name) => cookies[name])
-    .find(Boolean);
-
-  console.log(
-    "Session cookie found:",
-    raw ? "YES" : "NO"
-  );
-
-  if (!raw) {
-    console.log("AUTH RESULT: No session cookie");
-    console.log("================================");
+  if (!authHeader?.startsWith("Bearer ")) {
+    console.log("AUTH DEBUG: Authorization header missing");
     return null;
   }
 
-  const dotIndex = raw.lastIndexOf(".");
+  const token = authHeader.slice(7).trim();
 
-  if (dotIndex === -1) {
-    console.log("AUTH RESULT: Invalid cookie format");
-    console.log("================================");
+  if (!token) {
+    console.log("AUTH DEBUG: Token is empty");
     return null;
   }
 
-  const token = raw.slice(0, dotIndex);
-  const signature = raw.slice(dotIndex + 1);
+  try {
+    // Verify JWT signature using Better Auth JWKS
+    const { payload } = await jwtVerify(token, JWKS);
 
-  if (process.env.BETTER_AUTH_SECRET) {
-    const expected = crypto
-      .createHmac("sha256", process.env.BETTER_AUTH_SECRET)
-      .update(token)
-      .digest("base64");
+    console.log("AUTH DEBUG: JWT signature verified");
+    console.log("AUTH DEBUG: Issuer:", payload.iss);
+    console.log("AUTH DEBUG: Audience:", payload.aud);
+    console.log("AUTH DEBUG: Subject:", payload.sub);
 
-    const given = Buffer.from(signature);
-    const wanted = Buffer.from(expected);
-
-    if (
-      given.length !== wanted.length ||
-      !crypto.timingSafeEqual(given, wanted)
-    ) {
-      console.log("AUTH RESULT: Invalid signature");
-      console.log("================================");
+    // Check issuer
+    if (payload.iss !== AUTH_BASE_URL) {
+      console.log("AUTH DEBUG: Issuer mismatch");
       return null;
     }
-  }
 
-  const session = await authSessionCollection.findOne({
-    token,
-  });
+    // Check subject
+    if (!payload.sub) {
+      console.log("AUTH DEBUG: Subject missing");
+      return null;
+    }
 
-  if (!session) {
-    console.log("AUTH RESULT: Session not found in MongoDB");
-    console.log("================================");
+    // Find user in Better Auth database
+    const user = await findAuthUser(payload.sub);
+
+    if (!user) {
+      console.log("AUTH DEBUG: User not found in MongoDB");
+      return null;
+    }
+
+    console.log("AUTH DEBUG: User found successfully");
+
+    return user;
+  } catch (error) {
+    console.error("AUTH DEBUG: JWT verification failed");
+    console.error("Error:", error.name, error.message);
+
     return null;
   }
-
-  const expiresAt = new Date(session.expiresAt);
-
-  if (
-    Number.isNaN(expiresAt.getTime()) ||
-    expiresAt <= new Date()
-  ) {
-    console.log("AUTH RESULT: Session expired");
-    console.log("================================");
-    return null;
-  }
-
-  const user =
-    (await authUserCollection.findOne({
-      id: session.userId,
-    })) ||
-    (await authUserCollection.findOne({
-      _id: session.userId,
-    }));
-
-  if (!user) {
-    console.log("AUTH RESULT: User not found");
-    console.log("================================");
-    return null;
-  }
-
-  console.log("AUTH RESULT: SUCCESS");
-  console.log("User authenticated:", user.email);
-  console.log("================================");
-
-  return { session, user };
 }
 
-// Authentication Middleware
+// ==========================================
+// AUTHENTICATION MIDDLEWARE
+// ==========================================
+
 async function requireAuth(req, res, next) {
   try {
-    const auth = await verifySession(req);
+    console.log(
+      "AUTH DEBUG: Request",
+      req.method,
+      req.originalUrl
+    );
 
-    if (!auth) {
+    const user = await verifySession(req);
+
+    if (!user) {
+      console.log("AUTH DEBUG: Authentication rejected");
+
       return res.status(401).send({
         message: "You must be logged in to perform this action.",
       });
     }
 
-    req.authUser = auth.user;
+    req.authUser = user;
+
+    console.log("AUTH DEBUG: Authentication successful");
+
     next();
   } catch (error) {
-    console.error("Session verification failed:", error);
+    console.error("AUTH DEBUG: Middleware error:", error);
 
-    res.status(500).send({
-      message: "Failed to verify session",
+    return res.status(500).send({
+      message: "Authentication failed",
     });
   }
 }
 
-// 1. Root Route
+// ==========================================
+// ROOT ROUTE
+// ==========================================
+
 app.get("/", (req, res) => {
   res.send({
-    message: "Hello World!",
+    message: "CareCircle API is running!",
   });
 });
 
-// 2. Create Event
+// ==========================================
+// CREATE EVENT
+// ==========================================
+
 async function createEventHandler(req, res) {
   try {
     const {
@@ -257,14 +259,14 @@ async function createEventHandler(req, res) {
       createdAt: new Date(),
     });
 
-    res.send({
+    return res.send({
       success: true,
       result,
     });
   } catch (error) {
-    console.error("Failed to create event:", error);
+    console.error("Create event error:", error);
 
-    res.status(500).send({
+    return res.status(500).send({
       error: "Failed to create event",
     });
   }
@@ -273,7 +275,10 @@ async function createEventHandler(req, res) {
 app.post("/events", requireAuth, createEventHandler);
 app.post("/create-event", requireAuth, createEventHandler);
 
-// 3. Fetch All Events
+// ==========================================
+// FETCH ALL EVENTS
+// ==========================================
+
 app.get("/events", async (req, res) => {
   try {
     const result = await eventCollection
@@ -283,13 +288,18 @@ app.get("/events", async (req, res) => {
 
     res.send(result);
   } catch (error) {
+    console.error("Fetch events error:", error);
+
     res.status(500).send({
       error: "Failed to fetch events",
     });
   }
 });
 
-// 4. Fetch Organizer Events
+// ==========================================
+// FETCH ORGANIZER EVENTS
+// ==========================================
+
 app.get("/events/organizer", async (req, res) => {
   try {
     const email = req.query.email;
@@ -304,34 +314,42 @@ app.get("/events/organizer", async (req, res) => {
 
     res.send(result);
   } catch (error) {
+    console.error("Organizer events error:", error);
+
     res.status(500).send({
       error: "Failed to fetch organizer events",
     });
   }
 });
 
-// 5. Fetch Joined Events
+// ==========================================
+// FETCH JOINED EVENTS
+// ==========================================
+
 app.get("/events/joined", async (req, res) => {
   try {
     const userEmail = req.query.email;
 
-    const query = {
-      "volunteers.email": userEmail,
-    };
-
     const result = await eventCollection
-      .find(query)
+      .find({
+        "volunteers.email": userEmail,
+      })
       .toArray();
 
     res.send(result);
   } catch (error) {
+    console.error("Joined events error:", error);
+
     res.status(500).send({
       error: "Failed to fetch joined events",
     });
   }
 });
 
-// 6. Fetch Single Event
+// ==========================================
+// FETCH SINGLE EVENT
+// ==========================================
+
 app.get("/event/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -354,13 +372,18 @@ app.get("/event/:id", async (req, res) => {
 
     res.send(result);
   } catch (error) {
+    console.error("Single event error:", error);
+
     res.status(500).send({
       error: "Failed to fetch event details",
     });
   }
 });
 
-// 7. Join Event
+// ==========================================
+// JOIN EVENT
+// ==========================================
+
 app.post("/event/:id/join", requireAuth, async (req, res) => {
   try {
     const eventId = req.params.id;
@@ -437,7 +460,10 @@ app.post("/event/:id/join", requireAuth, async (req, res) => {
   }
 });
 
-// 8. Leave Event
+// ==========================================
+// LEAVE EVENT
+// ==========================================
+
 app.post("/event/:id/leave", requireAuth, async (req, res) => {
   try {
     const eventId = req.params.id;
@@ -480,7 +506,10 @@ app.post("/event/:id/leave", requireAuth, async (req, res) => {
   }
 });
 
-// 9. Update Event
+// ==========================================
+// UPDATE EVENT
+// ==========================================
+
 app.put("/event/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -552,7 +581,10 @@ app.put("/event/:id", requireAuth, async (req, res) => {
   }
 });
 
-// 10. Delete Event
+// ==========================================
+// DELETE EVENT
+// ==========================================
+
 app.delete("/event/:id", requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -596,18 +628,13 @@ app.delete("/event/:id", requireAuth, async (req, res) => {
   }
 });
 
-// Localhost + Vercel
+// ==========================================
+// LOCAL DEVELOPMENT & VERCEL
+// ==========================================
+
 if (!process.env.VERCEL) {
   app.listen(port, () => {
     console.log(`CareCircle API listening on port ${port}`);
-
-    console.log(
-      `Session HMAC verification: ${
-        process.env.BETTER_AUTH_SECRET
-          ? "ENABLED"
-          : "DISABLED"
-      }`
-    );
   });
 }
 

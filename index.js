@@ -137,7 +137,7 @@ async function verifySession(req) {
     }));
 
   if (!user) return null;
-
+console.log("Cookie received:", req.headers.cookie ? "YES" : "NO");
   return { session, user };
 }
 
